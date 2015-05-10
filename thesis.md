@@ -223,13 +223,25 @@ HRTimer是High Resolution Timer，也即高分辨率定时器的简写。计时�
 
 另外需要说明的是标准定时器的计时粒度采用的是时间滴答（jiffies）。时间滴答是一个在内核中广泛运用的全局变量。它的最后一位被称作时间滴答速率（tick rate）。在X86平台上，2.6版本的内核里，时间滴答速率通常配置为4ms（250Hz）。因此，可以认为，标准定时器的精度是毫秒级。
 
-综上，标准定时器仅仅适合小规模、粗粒度的定时应用。对于诸如媒体流处理等实时性高的应用场景，标准定时器无法应对。YAVIS是一个高性能的设备，其硬件发送、接收数据包的时间都是在微秒级，我们必须采用更高精度定时器 —— HRTimer。
+综上，标准定时器仅仅适合小规模、粗粒度的定时应用，如检测I/O设备的超时[Kernel Documentation/hrtimers]。对于诸如媒体流处理等高实时要求的应用场景，标准定时器无法应对。YAVIS是一个高性能的设备，其硬件发送、接收数据包的时间都是在微秒级，我们必须采用更高精度定时器 —— HRTimer。
 
-HRTimer在2.6.16版本合并进入内核树。它的核心沿用了标准定时器的机制。然而，HRTimer实现采用了按时间排序的链表替换时间轮。在这种新的设计下，下一个将到期的计时器将会被置于链表头。为了支持大规模的定时器使用情形，HRTimer引进了一个独立的红黑树在不搜索全表的情况下实现对定时器的快速插入和删除。另外，HRTimer的计时不再使用时间滴答，而是采用了一个名为k_time的数据结构。这个结构是机器相关的结构，在X86-64体系结构下，它是一个64位无符号整数，代表以纳秒为单位的时间。
+HRTimer在2.6.16版本合并进入内核树。它的核心沿用了标准定时器的机制。然而，HRTimer不使用 buckets 和串联操作，而是维护一个按时间排序的计时器数据结构（按时间顺序插入计时器，以最小化激活时的处理）。在这种新的设计下，下一个将到期的计时器将会被置于链表头。为了支持大规模的定时器使用情形，HRTimer引进了一个独立的红黑树，使得系统可以在不搜索全表的情况下实现对定时器的快速插入、删除和排序。另外，HRTimer的计时不再使用时间滴答，而是采用了一个名为k_time的数据结构。这个结构是机器相关的结构，在X86-64体系结构下，它是一个64位无符号整数，代表以纳秒为单位的时间。
 
 ##### 使用HRTimer #####
 
-HRTimer只是一种软件抽象。使用HRTimer之前，首先要确定硬件平台拥有高精度的时钟硬件。并在内核编译时打开相应支持选项。
+HRTimer只是一种软件抽象。使用HRTimer之前，首先要确定硬件平台拥有高精度的时钟硬件。HRTimer支持的平台包括：i386（UP/SMP），x86_64（UP/SMP），ARM，PPC。此外，在内核编译时打开相应支持选项：
+
+	CONFIG_TICK_ONESHOT=y	CONFIG_NO_HZ=y	CONFIG_HIGH_RES_TIMERS=y	CONFIG_GENERIC_CLOCKEVENTS_BUILD=y
+
+所有的hrtimer定时器被维护在每cpu的hrtimer_cpu_base类型的数据结构里。
+	struct hrtimer_cpu_base {		spinlock_t			lock;		struct hrtimer_clock_base	clock_base[HRTIMER_MAX_CLOCK_BASES];	#ifdef CONFIG_HIGH_RES_TIMERS		ktime_t				expires_next;		int				hres_active;		unsigned long			nr_events;	#endif	};
+其中hrtimer_clock_base这个结构体保存了真正的定时器，HRTIMER_MAX_CLOCK_BASES为2，这个数组的hrtimer_clock_base分别表示了CLOCK_REALTIME和CLOCK_MONOTONIC的类型的定时器。由于在hrtimer_interrupt里面首先执行的CLOCK_RELTIME的定时器，所以其定时器优先级较CLOCK_MONOTONIC更高。
+	struct hrtimer_clock_base {		struct hrtimer_cpu_base	*cpu_base;		clockid_t		index;		struct rb_root		active;		struct rb_node		*first;		ktime_t			resolution;		ktime_t			(*get_time)(void);		ktime_t			softirq_time;	#ifdef CONFIG_HIGH_RES_TIMERS		ktime_t			offset;	#endif	};
+
+然后在本地时钟中断的hrtimer_interrupt函数中，执行到期的hrtimer定时器。而sched_timer这个特殊的hrtimer定时器的回调函数最后又调用了update_process_times处理time wheel的定时器。
+
+每个hrtimer定时器对应一个hrtimer类型的结构体。
+	struct hrtimer {		struct rb_node			node;   //节点将会加入到红黑树中		ktime_t				_expires; //到期时间		ktime_t				_softexpires; //软到期时间（效率原因）		enum hrtimer_restart		(*function)(struct hrtimer *);  //回调方法		struct hrtimer_clock_base	*base;		unsigned long			state;		struct list_head		cb_entry;	};
 
 hrtimer_init函数用来初始化hrtimer结构体对象。调用函数时需要在参数中指定时钟类型和计时模式。在Linux中共有两种时钟类型。一种是CLOCK-REALTIME，真实世界时钟，有时称为墙上时钟，可以前后调整。另一种类型为CLOCK-MONOTONIC，单调时钟。单调时钟只会增长，不能被回调。单调时钟不需要与真实世界时钟同步。计时模式也有两种：相对定时和绝对定时。相对定时在一个指定的时间间隔后触发，绝对定时在指定的时间点上触发。
 
