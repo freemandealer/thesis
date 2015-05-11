@@ -111,7 +111,7 @@ EoIB（Ethernet over Infiniband），是另一种Infiniband与以太网融合技
 
 
 ## 虚拟以太网卡YAVIS的设计与实现 ##
-YAVIS是基于融合互连网络通信系统的虚拟以太网卡，用来实现对TCP/IP的透明支持。YAVIS实质上是一个网卡驱动。只不过这个驱动并不对应一个物理网络接口卡（简称网卡），而是将另一个物理硬件，即融合控制器，虚拟成一个逻辑上的网卡。本章将详细描述YAVIS的设计和实现方法并探讨相关优化细节。
+YAVIS是基于融合互连网络通信系统的虚拟以太网卡，用来实现对TCP/IP的透明支持。YAVIS实质上是一个网卡驱动。只不过这个驱动并不对应一个物理网络接口卡（简称网卡），而是将另一个物理硬件，即融合控制器，虚拟成一个逻辑上的网卡。正因如此，YAVIS不像普通网卡驱动那样直接使用硬件接口，而是通过与BCL通信交互的方式完成数据收发。本章将详细描述YAVIS的设计和实现方法并探讨相关优化细节。
 
 ### Linux网卡驱动框架 ###
 YAVIS实质上是作为Linux内核的一个驱动模块实现的。本小节介绍Linux网卡驱动程序的实现原理。
@@ -174,9 +174,10 @@ TCP/IP在Linux中的实现，依赖一个重要的数据结构sk_buff。在TCP/I
 
 sk_buff也是一个复杂的大型的数据结构，与其它模块如socket等有错综复杂的关系，限于篇幅，我们不做深入讨论。
 
-### YAVIS通信实现 ###
+### YAVIS与BCL通信库的交互 ###
 
-### YAVIS在通信系统中的上下文 ####
+#### YAVIS在通信系统中的上下文 ####
+
 本小节将基于整个高性能融合互连网络通信系统的宏观视角，分析YAVIS在系统中所处的层次和环境，以便设计出YAVIS与整个通信系统的整合方案。
 
 YAVIS采用BCL用户级通信库完成处理单元间的通信。底层硬件为融合控制器。YAVIS构成的通信系统如图所示：
@@ -191,15 +192,98 @@ YAVIS使用BCL通信库完成数据的收发，与普通网卡驱动直接控制
 
 然而YAVIS并不能直接调用BCL通信库收发接口。以太网卡和融合控制器两者面向的应用领域不同导致设计思路不同，进而导致通信方式存在差异。其一，以太网使用IP地址来寻址网络上的机器，而融合控制器则是通过计算节点的ID寻址。其二，BCL通信库的NAP通信模式下发送的数据必须是八字节对齐的，而以太网帧对数据帧大小并无限制。此外，BCL通信库的RDMA　PUT通信模式下，通信二者在收发数据前会进行缓冲区的协商，而以太网通信是没有这个过程的。为了消除二者的差异，我们有必要仔细设计YAVIS同BCL通信库的交互方式。
 
+#### 解除NAP模式下的内存对齐限制 ####
+BCL通信库的NAP通信模式是设计来发送长度较小的数据包的，主要目的是在后面发送或接收大数据包之前进行握手协商。NAP通信模式发送的数据包大小被严格限定为八字节对齐。想用NAP发送长度任意的以太网数据包，需要解除这个限制。考虑到这实质上是为了简化BCL设计做出的人为限制，解除相关限制，逻辑上应当是BCL通信库的任务，而非YAVIS的工作。所以，在这里我们为BCL通信库制作了一个解除八字节对齐限制的补丁，主要修改内容如下：
+
+	--- a/bcl6/bcl/communication/qp_send.c
+	+++ b/bcl6/bcl/communication/qp_send.c
+	@@ -160,13 +160,16 @@ int Qp_Nap_Send(Qp_t *qp, u8 dst_cpu, u8 dst_qp, u32 len, u8 flag, Nap_Load_t *l
+		switch(load->type) {
+		case NAP_IMM:
+	-		cmd->data_len = len;
+	+		//8 byte for the real length of packet, and the packet is 8 byte packed!!
+	+		cmd->data_len = 8 + ((len+7) & (~0x7));
+			cmd->s_flag     = flag;
+			cmd->type     = NAP_IMM;
+	-		memcpy(cmd->info, load->buff, cmd->data_len);
+	+		cmd->info[0] = len;
+	+
+	+		memcpy(&cmd->info[1], load->buff, len);
+	 
+	-		packet_len    = HARD_HEAD_LEN + ((cmd->data_len + 7) & ~0x7);
+	+		packet_len    = HARD_HEAD_LEN + cmd->data_len;
+			offset        = (void *)cmd + packet_len;
+			memcpy(offset, &soft_head, sizeof(u64));
+
+上述补丁片段修改了qp_send.c源文件中Qp_Nap_Send函数的实现。Qp_Nap_Send是NAP模式下发送数据帧的代码。修改集中在对数据的长度的操作。同样，修改qp_recv.c源文件中对应的接收函数Qp_Rpoll，补丁片段如下：
+	
+	--- a/bcl6/bcl/communication/qp_recv.c
+	+++ b/bcl6/bcl/communication/qp_recv.c
+	@@ -59,7 +59,14 @@ void Qp_Rpoll(Qp_t *qp, REvt_t *revt_p)
+	-		memcpy(revt_p->rbuff, buff, qp_revt->len);
+	+		if(revt_p->type == NAP_UNIMM) {
+	+			memcpy(revt_p->rbuff, buff, qp_revt->len);
+	+		}
+	+		else {
+	+			revt_p->msg_len = *(u64*)buff;
+	+			memcpy(revt_p->rbuff, buff+8, revt_p->msg_len);
+	+		}
+		}else{
+				revt_p->msg_len = qp_revt->buf_len;
+		}
+
+#### 地址映射 ####
+以太网和融合控制器具有不同的寻址方式。以太网使用IP地址寻址网络上的主机，而融合控制器采用CUPID来寻址。我们需要在YAVIS中实现两种地址的映射。其实在传统网卡驱动中，地址映射普遍存在，并与有名的ARP地址解析协议相关联。只不过传统网卡是在IP地址和网卡硬件地址(MAC地址)之间映射，IP-MAC映射，而YAVIS需要完成IP-CPUID映射。
+
+我们的IP-CPUID映射采用简单的一一映射，就是将CPUID转换为IPv4地址的最后一个字节。为了简化问题，这里的使用C类地址，也即子网掩码为:255.255.255.0的地址。需要注意的是IP地址最后一位为0时代表子网络，最后一位为255代表广播地址，所以IP地址最后一位实际上从1开始。由于CPUID是从0开始的，所以IP地址最后一位总比CPUID大一，而且CPUID最大不能超过253。如：192.168.1.1的IP地址可以解析成CPUID为0的节点。向192.168.1.254发送数据时目标CPUID应当是253。
+
+需要特别处理的是广播地址（C类IP地址最后一位为255）的情况。这时，我们应向所有已知节点发送数据。
+
+#### YAVIS在NAP模式下的通信过程 ####
+NAP（No Address Packet），顾名思义，是指该操作没有具体的目标地址空间，NAP包中的数据会放入默认的接收缓冲区中。因此NAP包支持的最大长度为2KB。NAP通信包括两种方式，分别为NAP立即数和NAP间接数。二者的区别在于NAP立即数的描述符中直接包含发送的数据，而NAP间接数的描述符中的内容是发送数据的地址。YAVIS使用NAP立即数，让DMA引擎通过门铃就能够得到需要传输数据的地址和长度，降低系统设计的复杂度。
+
+![NAP包发送流程]()
+
+图[]描述NAP包发送的流程，NAP通信的流程如下：
+
+- 将需要传输的数据按NAP的发送格式以8字节对齐写入通信库自己维护的一块内存空间。
+- 将所在内存空间的首地址和长度以门铃的方式发送给对应QP的发送使能寄存器（QP_DB_WINDOW寄存器）。
+- DMA发送引擎根据门铃发出一个或者多个PCIe内存读包读取NAP立即数和其它相关信息（PCIe内存读包一次最大可以读取128byte的数据）。
+- DMA发送引擎根据返回的PCIe响应包，提取出数据和其它相关信息生成NAP包发出。
+- DMA接收引擎接收NAP包，将其中的数据写入接收数据缓冲区，数据接收缓冲区是一个由融合控制器维护的环形队列。
+
+![YAVIS-NAP模式下数据包发送过程]()
+![YAVIS-NAP模式下数据包接收过程]()
+
+#### YAVIS在RDMA-PUT模式下的通信过程 ####
+与NAP模式不同，RDMA-PUT操作能够支持大量数据的传递，可以给网络提供更高的带宽。NAP通信方式侧重低延时操作。NAP包的接收需要一个预先制定好的环形缓冲区，因此NAP不需要地址的协商，而PUT/GET的地址需要先通过NAP进行沟通握手，通过沟通接收的地址后，然后再发起RDMA PUT/GET操作。RDMA-PUT和GET的操作方式类似，不同的是GET和PUT的源和目的正好是相反的，GET是从远端的内存中取数据，可以把GET的实现理解为GET转化为远端融合控制器的PUT操作。YAVIS使用RDMA-PUT模式。
+
+在RDMA-PUT模式下，DMA引擎通过描述符能够得到源地址、源长度、目标地址、目标长度和其它控制信息。不同的目标地址会生成不同的网络包；同一个目标地址，如果数据长度大于2KB，也会生成多个网络包。对于每次RDMA-PUT操作，DMA发送引擎生成的最后一个数据包称为尾包，尾包中包含软件包头等控制信息。
+
+![RDMA PUT通信流程]()
+
+下面介绍PUT的通信流程，其通信流程如图[]所示：
+
+- 生成RDMA PUT操作的描述符，并将描述符按照8字节对齐的方式写入通信库自己维护的一块内存空间
+- 将描述符在内存空间中的首地址和描述符的长度信息（称为门铃）写入对应QP的QP_DB_WINDOW寄存器中。
+- DMA发送引擎根据门铃提供的地址和长度发出PCIe读包读取内存中的描述符。一个描述符可以对应一个或者多个PCIe读包。
+- DMA发送引擎接收返回的PCIe响应包，提取其中的描述符。
+- DMA发送引擎根据描述符中的源地址和长度信息，从内存中读取数据并生成RDMA PUT网络包发出。
+- DMA接收引擎接收RDMA PUT网络包，将其中的数据写入接收数据缓冲区。
+
+从中我们了解到RDMA-PUT通信方式在网卡驱动中的应用的难点在于：RDMA-PUT发送动作里包含接收的动作，接收动作里包含有发送的动作。具体过程可以描述为图[]。
+
+
+
 ### YAVIS通信效率优化 ###
 YAVIS作为虚拟高性能网卡，需要承载较大的工作负荷。具体说，就是在单位时间内需要完成超出普通网卡几十甚至上百倍数量的数据收发任务。这种特殊性，带来了效率优化方面的研究需求并提供了研究空间。
 
-#### 轮询还是中断 ####
+#### 中断还是轮询 ####
 为了通信系统的性能，网络数据的收发在是异步进行的。内核通过事件机制来了解数据的收发情况。当网卡硬件完成数据发送任务后，会触发一个发送完成事件。当网卡接收到数据后，会触发一个接收完成事件。内核查询这些事件，并进行相应的处理。本节讨论的主要问题是：如何获得事件？
 
 在一般情况下，中断毫无疑问是一种优雅高效的获得事件的方式。在事件没有被触发时，处理器可以处理其它任务。一旦事件到来，处理器被中断，进入中断响应例程(Interrupt Service Rutine)。而通过轮询方式获得事件，通常被认为是一种拙劣的实现方式。因为轮询方式下，不管事件触发与否，处理器需要全力以赴重复着询问事件的状态直到状态发生改变。轮询方式是对处理器资源的浪费，间接增加了能耗、提高处理器温度，降低了系统效能。
 
-但是在高性能平台上，轮询是获得高性能通信的一种重要途径。由于高性能平台上计算资源丰富。南京信息工程大学的大型机上就配置了三百多个处理器，拥有三千多个核心。图[]所示的趋势下，通信带宽相比而言，是稀缺资源。轮询的思路本质上就是牺牲一个计算核心，让它对事件进行高速轮询，以在最短的时间内获得数据发送或接收事件，提高通信效率。恰恰相反，在高性能通信系统中使用中断方式，会由于单位时间内系统需要响应的事件可能多到超过处理器能处理的中断数量，从而导致中断嵌套，事件无法顺利被处理，导致系统性能急剧下降。
+但是在高性能平台上，轮询是获得高性能通信的一种重要途径。由于高性能平台上计算资源丰富。南京信息工程大学的大型机上就配置了三百多个处理器，拥有3696个核心[大型机使用手册]。图[]所示的趋势下，通信带宽相比而言，是稀缺资源。轮询的思路本质上就是牺牲一个计算核心，让它对事件进行高速轮询，以在最短的时间内获得数据发送或接收事件，提高通信效率。恰恰相反，在高性能通信系统中使用中断方式，会由于单位时间内系统需要响应的事件可能多到超过处理器能处理的中断数量，从而导致中断嵌套，事件无法顺利被处理，导致系统性能急剧下降。
 
 ![处理器性能和通信性能变化示意图]()
 
@@ -245,17 +329,51 @@ HRTimer在2.6.16版本合并进入内核树。它的核心沿用了标准定时�
 
 HRTimer只是一种软件抽象。使用HRTimer之前，首先要确定硬件平台拥有高精度的时钟硬件。HRTimer支持的平台包括：i386（UP/SMP），x86_64（UP/SMP），ARM，PPC。此外，在内核编译时打开相应支持选项：
 
-	CONFIG_TICK_ONESHOT=y	CONFIG_NO_HZ=y	CONFIG_HIGH_RES_TIMERS=y	CONFIG_GENERIC_CLOCKEVENTS_BUILD=y
+	CONFIG_TICK_ONESHOT=y
+	CONFIG_NO_HZ=y
+	CONFIG_HIGH_RES_TIMERS=y
+	CONFIG_GENERIC_CLOCKEVENTS_BUILD=y
 
 所有的hrtimer定时器被维护在每cpu的hrtimer_cpu_base类型的数据结构里。
-	struct hrtimer_cpu_base {		spinlock_t			lock;		struct hrtimer_clock_base	clock_base[HRTIMER_MAX_CLOCK_BASES];	#ifdef CONFIG_HIGH_RES_TIMERS		ktime_t				expires_next;		int				hres_active;		unsigned long			nr_events;	#endif	};
-其中hrtimer_clock_base这个结构体保存了真正的定时器，HRTIMER_MAX_CLOCK_BASES为2，这个数组的hrtimer_clock_base分别表示了CLOCK_REALTIME和CLOCK_MONOTONIC的类型的定时器。由于在hrtimer_interrupt里面首先执行的CLOCK_RELTIME的定时器，所以其定时器优先级较CLOCK_MONOTONIC更高。
-	struct hrtimer_clock_base {		struct hrtimer_cpu_base	*cpu_base;		clockid_t		index;		struct rb_root		active;		struct rb_node		*first;		ktime_t			resolution;		ktime_t			(*get_time)(void);		ktime_t			softirq_time;	#ifdef CONFIG_HIGH_RES_TIMERS		ktime_t			offset;	#endif	};
+
+	struct hrtimer_cpu_base {
+		spinlock_t			lock;
+		struct hrtimer_clock_base	clock_base[HRTIMER_MAX_CLOCK_BASES];
+	#ifdef CONFIG_HIGH_RES_TIMERS
+		ktime_t				expires_next;
+		int				hres_active;
+		unsigned long			nr_events;
+	#endif
+	};
+
+其中hrtimer_clock_base这个结构体保存了真正的定时器，HRTIMER_MAX_CLOCK_BASES为2，这个数组的hrtimer_clock_base分别表示了CLOCK_REALTIME和CLOCK_MONOTONIC的类型的定时器。由于在hrtimer_interrupt里面首先执行的CLOCK_RELTIME的定时器，所以其定时器优先级较CLOCK_MONOTONIC更高。
+
+	struct hrtimer_clock_base {
+		struct hrtimer_cpu_base	*cpu_base;
+		clockid_t		index;
+		struct rb_root		active;
+		struct rb_node		*first;
+		ktime_t			resolution;
+		ktime_t			(*get_time)(void);
+		ktime_t			softirq_time;
+	#ifdef CONFIG_HIGH_RES_TIMERS
+		ktime_t			offset;
+	#endif
+	};
 
 然后在本地时钟中断的hrtimer_interrupt函数中，执行到期的hrtimer定时器。而sched_timer这个特殊的hrtimer定时器的回调函数最后又调用了update_process_times处理time wheel的定时器。
 
 每个hrtimer定时器对应一个hrtimer类型的结构体。
-	struct hrtimer {		struct rb_node			node;   //节点将会加入到红黑树中		ktime_t				_expires; //到期时间		ktime_t				_softexpires; //软到期时间（效率原因）		enum hrtimer_restart		(*function)(struct hrtimer *);  //回调方法		struct hrtimer_clock_base	*base;		unsigned long			state;		struct list_head		cb_entry;	};
+
+	struct hrtimer {
+		struct rb_node			node;   //节点将会加入到红黑树中
+		ktime_t				_expires; //到期时间
+		ktime_t				_softexpires; //软到期时间（效率原因）
+		enum hrtimer_restart		(*function)(struct hrtimer *);  //回调方法
+		struct hrtimer_clock_base	*base;
+		unsigned long			state;
+		struct list_head		cb_entry;
+	};
 
 hrtimer_init函数用来初始化hrtimer结构体对象。调用函数时需要在参数中指定时钟类型和计时模式。在Linux中共有两种时钟类型。一种是CLOCK-REALTIME，真实世界时钟，有时称为墙上时钟，可以前后调整。另一种类型为CLOCK-MONOTONIC，单调时钟。单调时钟只会增长，不能被回调。单调时钟不需要与真实世界时钟同步。计时模式也有两种：相对定时和绝对定时。相对定时在一个指定的时间间隔后触发，绝对定时在指定的时间点上触发。
 
@@ -263,7 +381,8 @@ hrtimer结构体的function字段指向定时器一次到期后执行的执行�
 
 hrtimer_start函数可以激活定时器。通过参数可以方便地设定定时时间间隔。需要注意的是，时间间隔使用k_time结构描述，所以可以通过ktime_set辅助函数获得一个k_time。
 
-HRTimer的定时是一次性的。即时间到期事件被触发后，定时器默认自动关闭。再过一个时间间隔，计时器到期事件将不再触发。YAVIS需要按指定的间隔，不断执行轮询动作。处理这个问题，只需要在到期响应处理完成后调用hrtimer_forward_now，设定下一次到期时间即可。这里体现出了HRTimer的灵活性。
+HRTimer的定时是一次性的。即时间到期事件被触发后，定时器默认自动关闭。再过一个时间间隔，计时器到期事件将不再触发。YAVIS需要按指定的间隔，不断执行轮询动作。处理这个问题，只需要在到期响应处理完成后调用hrtimer_forward_now，设定下一次到期时间即可。hrtimer_forward_now会返回一个代表定时器OVER-RUN次数的整型变量。通过这个变量我们可以知道hrtimer的触发的这一次事件前有多少个定时事件没有来得及处理而被跳过。从而了解系统负载情况，并对定时器间隔进行调整。hrtimer_forward_now体现出了HRTimer的灵活性。
+
 
 
 
@@ -455,8 +574,35 @@ SystemTap语言是一种与C语言和awk语言类似的脚本语言。限于篇�
 (这里在加一个性能测量的例子)
 
 ## 性能测试及分析 ##
+本章将对YAVIS虚拟以太网卡的性能进行测试，并给出对相关结果的分析。
+
+### 系统测试环境 ###
+
+![硬件平台1](img/ffc_controller1.png)
+![硬件平台2](img/ffc_controller2.png)
+
+由于高性能融合网络通信系统尚未搭建完毕，本章所做的所有测试全部基于原型平台。融合控制器原型硬件由Xilinx Virtex7 xc7vx690tffg1927实现。使用iperf和ping工具，对通信系统性能进行测试。具体参数如表[]：
+
+![平台相关参数](img/platform.png)
+
+### TCP/IP连通性测试 ###
+
+![连通性测试](img/ping_connection.png)
+
+### 延迟测试 ###
+
+![YAVIS延时测试]()
+
+![YAVIS轮询方式延时测试]()
+
+### 带宽测试 ###
+
+宿主机中使用NAP模式的YAVIS可以达到289.5MB，客户机使用NAP模式的YAVIS可以达到278.3MB。二者的通信带宽约占NAP通信带宽的50%。宿主机中基于PUT模式的YAVIS可以达到821.8MB，客户机可以达到801.5MB，性能可以达到RDMA-PUT通信性能的65%以上
+
+
 
 ## 总结和展望 ##
+### 本文工作总结 ###
 
 
 ---
@@ -467,80 +613,5 @@ SystemTap语言是一种与C语言和awk语言类似的脚本语言。限于篇�
 ## FFC控制器RDMA通信流程 ##
 　　　FFC控制器实现了三类RDMA操作，分别是立即数（NAP，No Address Packet）、RDMA-PUT、RMDA-GET。FFC控制器采用类似于Infiniband规范采用的“门铃”机制启动DMA发送操作，门铃启动方式保证了与FFC控制器连接的多核处理器或者对称处理器核心都能够独立地在用户空间启动DMA操作。一次DMA操作支持最多128个源数据块一次性地传送到128个目标空间。每个源数据块可以任意起始地址（40位物理地址对其）、任意长度（不大于2MB）；每个目标空间同样可以任意起始地址、任意长度。不要求源数据块的个数和目标空间的个数相等，只要求传输数据的总长度等于目标空间的总容量。
 　　　下面对这几种RDMA支持的传输进行简单的介绍：
-NAP操作，顾名思义，是指该操作没有具体的目标地址空间，NAP包中的数据会放入默认的接收缓冲区中。因此NAP包支持的最大长度为2KB。DMA引擎支持两种方式的NAP操作，NAP立即数，是指DMA引擎通过门铃就能够得到需要传输数据的地址和长度；NAP间接数，是指DMA引擎通过门铃只能够得到“描述符”，需要传输的数据由描述符表示。
-RDMA-PUT操作能够支持大量数据的传递。DMA引擎通过描述符能够得到源地址、源长度、目标地址、目标长度和其它控制信息。不同的目标地址会生成不同的网络包；同一个目标地址，如果数据长度大于2KB，也会生成多个网络包。对于每次RDMA-PUT操作，DMA发送引擎生成的最后一个数据包称为尾包，尾包中包含软件包头等控制信息。
-RDMA-GET操作，是指DMA发送引擎将根据门铃得到的描述符作为数据发送，由远方DMA引擎执行操作。因此，RDMA-GET操作中的源和目标的位置与RDMA-PUT相比是反的。
-3.1.1 NAP通信方式
-
-图3-1 NAP包发送流程
-　　　NAP通信包括两种方式，分别为NAP立即数和NAP间接数。二者的区别在于NAP立即数的描述符中直接包含发送的数据，而NAP间接数的描述符中的内容是发送数据的地址。
-　　　如图3-1是NAP包发送的流程，NAP通信的流程如下：
-将需要传输的数据按NAP的发送格式以8字节对齐写入通信库自己维护的一块内存空间。
-将所在内存空间的首地址和长度以门铃的方式发送给对应QP的发送使能寄存器（QP_DB_WINDOW寄存器）。
-DMA发送引擎根据门铃发出一个或者多个PCIe内存读包读取NAP立即数和其它相关信息（PCIe内存读包一次最大可以读取128byte的数据）。
-DMA发送引擎根据返回的PCIe响应包，提取出数据和其它相关信息生成NAP包发出。
-DMA接收引擎接收NAP包，将其中的数据写入接收数据缓冲区，数据接收缓冲区是一个由FFC控制器维护的环形队列。
-3.1.2 PUT/GET通信方式
-　　　RDMA-PUT和RDMA-GET是针对发送大数据量的RDMA操作，可以给网络提供更高的带宽。PUT/GET通信方式和NAP不同，NAP包更侧重于低延时操作。NAP包的接收需要一个预先制定好的环形缓冲区，因此NAP不需要地址的协商，而PUT/GET的地址需要先通过NAP进行沟通握手，通过沟通接收的地址后，然后再发起RDMA PUT/GET操作。
-　　　RDMA-PUT和GET的操作方式类似，不同的是GET和PUT的源和目的正好是相反的，GET是从远端的内存中取数据，可以把GET的实现理解为GET转化为远端FFC控制器的PUT操作。
-
-图3-2 RDMA PUT通信流程
-　　　RDMA PUT和GET的通信类似，下面介绍PUT的通信流程，其通信流程如图3-2所示：
-生成RDMA PUT操作的描述符，并将描述符按照8字节对齐的方式写入通信库自己维护的一块内存空间
-将描述符在内存空间中的首地址和描述符的长度信息（称为门铃）写入对应QP的QP_DB_WINDOW寄存器中。
-DMA发送引擎根据门铃提供的地址和长度发出PCIe读包读取内存中的描述符。一个描述符可以对应一个或者多个PCIe读包。
-DMA发送引擎接收返回的PCIe响应包，提取其中的描述符。
-DMA发送引擎根据描述符中的源地址和长度信息，从内存中读取数据并生成RDMA PUT网络包发出。
-DMA接收引擎接收RDMA PUT网络包，将其中的数据写入接收数据缓冲区。
-
-
-#### 解除NAP模式下的内存对齐限制 ####
-BCL通信库的NAP通信模式是设计来发送长度较小的数据包的，主要目的是在后面发送或接收大数据包之前进行握手协商。NAP通信模式发送的数据包大小被严格限定为八字节对齐。想用NAP发送长度任意的以太网数据包，需要解除这个限制。考虑到这实质上是为了简化BCL设计做出的人为限制，解除相关限制，逻辑上应当是BCL通信库的任务，而非YAVIS的工作。所以，在这里我们为BCL通信库制作了一个解除八字节对齐限制的补丁。
-
-	--- a/bcl6/bcl/communication/qp_send.c
-	+++ b/bcl6/bcl/communication/qp_send.c
-	@@ -160,13 +160,16 @@ int Qp_Nap_Send(Qp_t *qp, u8 dst_cpu, u8 dst_qp, u32 len, u8 flag, Nap_Load_t *l
-		switch(load->type) {
-		case NAP_IMM:
-	-		cmd->data_len = len;
-	+		//8 byte for the real length of packet, and the packet is 8 byte packed!!
-	+		cmd->data_len = 8 + ((len+7) & (~0x7));
-			cmd->s_flag     = flag;
-			cmd->type     = NAP_IMM;
-	-		memcpy(cmd->info, load->buff, cmd->data_len);
-	+		cmd->info[0] = len;
-	+
-	+		memcpy(&cmd->info[1], load->buff, len);
-	 
-	-		packet_len    = HARD_HEAD_LEN + ((cmd->data_len + 7) & ~0x7);
-	+		packet_len    = HARD_HEAD_LEN + cmd->data_len;
-			offset        = (void *)cmd + packet_len;
-			memcpy(offset, &soft_head, sizeof(u64));
-
-上述补丁片段修改了qp_send.c源文件中Qp_Nap_Send函数的实现。Qp_Nap_Send是NAP模式下发送数据帧的代码。修改集中在对数据的长度的操作。同样，修改qp_recv.c源文件中对应的接收函数Qp_Rpoll，补丁片段如下：
-	
-	--- a/bcl6/bcl/communication/qp_recv.c
-	+++ b/bcl6/bcl/communication/qp_recv.c
-	@@ -59,7 +59,14 @@ void Qp_Rpoll(Qp_t *qp, REvt_t *revt_p)
-	-		memcpy(revt_p->rbuff, buff, qp_revt->len);
-	+		if(revt_p->type == NAP_UNIMM) {
-	+			memcpy(revt_p->rbuff, buff, qp_revt->len);
-	+		}
-	+		else {
-	+			revt_p->msg_len = *(u64*)buff;
-	+			memcpy(revt_p->rbuff, buff+8, revt_p->msg_len);
-	+		}
-		}else{
-				revt_p->msg_len = qp_revt->buf_len;
-		}
-
-#### 地址映射 ####
-以太网和融合控制器具有不同的寻址方式。以太网使用IP地址寻址网络上的主机，而融合控制器采用CUPID来寻址。我们需要在YAVIS中实现两种地址的映射。其实在传统网卡驱动中，地址映射普遍存在，并与有名的ARP地址解析协议相关联。只不过传统网卡是在IP地址和网卡硬件地址(MAC地址)之间映射罢了。
-
-我们的IP-CPUID映射采用简单的一一映射，就是将CPUID映射为IPv4地址的最后一个字节。为了简化问题，这里的使用C类地址，也即子网掩码为:255.255.255.0的地址。需要注意的是IP地址最后一位为0时代表子网络，最后一位为255代表广播地址。所以IP地址最后一位实际上从1开始，而CPUID是从0开始的，所以IP地址最后一位总比CPUID大一，而且CPUID最大不能超过253。如：192.168.1.1的IP地址可以解析成CPUID为0的节点。向192.168.1.254发送数据时目标CPUID应当是253。
-
-需要特别处理的是广播地址（C类IP地址最后一位为255）的情况。这时，我们应向所有已知节点发送数据。
-
-
 
 
